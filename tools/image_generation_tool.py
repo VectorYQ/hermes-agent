@@ -400,11 +400,45 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
         return fal_client.submit(model, arguments=arguments, headers=request_headers)
 
     managed_client = _get_managed_fal_client(managed_gateway)
-    return managed_client.submit(
-        model,
-        arguments=arguments,
-        headers=request_headers,
-    )
+    try:
+        return managed_client.submit(
+            model,
+            arguments=arguments,
+            headers=request_headers,
+        )
+    except Exception as exc:
+        # 4xx from the managed gateway typically means the portal doesn't
+        # currently proxy this model (allowlist miss, billing gate, etc.)
+        # — surface a clearer message with actionable remediation instead
+        # of a raw HTTP error from httpx.
+        status = _extract_http_status(exc)
+        if status is not None and 400 <= status < 500:
+            raise ValueError(
+                f"Nous Subscription gateway rejected model '{model}' "
+                f"(HTTP {status}). This model may not yet be enabled on "
+                f"the Nous Portal's FAL proxy. Either:\n"
+                f"  • Set FAL_KEY in your environment to use FAL.ai directly, or\n"
+                f"  • Pick a different model via `hermes tools` → Image Generation."
+            ) from exc
+        raise
+
+
+def _extract_http_status(exc: BaseException) -> Optional[int]:
+    """Return an HTTP status code from httpx/fal exceptions, else None.
+
+    Defensive across exception shapes — httpx.HTTPStatusError exposes
+    ``.response.status_code`` while fal_client wrappers may expose
+    ``.status_code`` directly.
+    """
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            return status
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    return None
 
 
 # ---------------------------------------------------------------------------

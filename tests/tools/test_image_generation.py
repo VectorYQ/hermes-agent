@@ -317,3 +317,127 @@ class TestRegistryIntegration:
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
         assert set(enum) == {"landscape", "square", "portrait"}
+
+
+# ---------------------------------------------------------------------------
+# Managed gateway 4xx translation
+# ---------------------------------------------------------------------------
+
+class _MockResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+class _MockHttpxError(Exception):
+    """Simulates httpx.HTTPStatusError which exposes .response.status_code."""
+    def __init__(self, status_code: int, message: str = "Bad Request"):
+        super().__init__(message)
+        self.response = _MockResponse(status_code)
+
+
+class TestExtractHttpStatus:
+    """Status-code extraction should work across exception shapes."""
+
+    def test_extracts_from_response_attr(self, image_tool):
+        exc = _MockHttpxError(403)
+        assert image_tool._extract_http_status(exc) == 403
+
+    def test_extracts_from_status_code_attr(self, image_tool):
+        exc = Exception("fail")
+        exc.status_code = 404  # type: ignore[attr-defined]
+        assert image_tool._extract_http_status(exc) == 404
+
+    def test_returns_none_for_non_http_exception(self, image_tool):
+        assert image_tool._extract_http_status(ValueError("nope")) is None
+        assert image_tool._extract_http_status(RuntimeError("nope")) is None
+
+    def test_response_attr_without_status_code_returns_none(self, image_tool):
+        class OddResponse:
+            pass
+        exc = Exception("weird")
+        exc.response = OddResponse()  # type: ignore[attr-defined]
+        assert image_tool._extract_http_status(exc) is None
+
+
+class TestManagedGatewayErrorTranslation:
+    """4xx from the Nous managed gateway should be translated to a user-actionable message."""
+
+    def test_4xx_translates_to_value_error_with_remediation(self, image_tool, monkeypatch):
+        """403 from managed gateway → ValueError mentioning FAL_KEY + hermes tools."""
+        from unittest.mock import MagicMock
+
+        # Simulate: managed mode active, managed submit raises 4xx.
+        managed_gateway = MagicMock()
+        managed_gateway.gateway_origin = "https://fal-queue-gateway.example.com"
+        managed_gateway.nous_user_token = "test-token"
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
+                            lambda: managed_gateway)
+
+        bad_request = _MockHttpxError(403, "Forbidden")
+        mock_managed_client = MagicMock()
+        mock_managed_client.submit.side_effect = bad_request
+        monkeypatch.setattr(image_tool, "_get_managed_fal_client",
+                            lambda gw: mock_managed_client)
+
+        with pytest.raises(ValueError) as exc_info:
+            image_tool._submit_fal_request("fal-ai/nano-banana", {"prompt": "x"})
+
+        msg = str(exc_info.value)
+        assert "fal-ai/nano-banana" in msg
+        assert "403" in msg
+        assert "FAL_KEY" in msg
+        assert "hermes tools" in msg
+        # Original exception chained for debugging
+        assert exc_info.value.__cause__ is bad_request
+
+    def test_5xx_is_not_translated(self, image_tool, monkeypatch):
+        """500s are real outages, not model-availability issues — don't rewrite them."""
+        from unittest.mock import MagicMock
+
+        managed_gateway = MagicMock()
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
+                            lambda: managed_gateway)
+
+        server_error = _MockHttpxError(502, "Bad Gateway")
+        mock_managed_client = MagicMock()
+        mock_managed_client.submit.side_effect = server_error
+        monkeypatch.setattr(image_tool, "_get_managed_fal_client",
+                            lambda gw: mock_managed_client)
+
+        with pytest.raises(_MockHttpxError):
+            image_tool._submit_fal_request("fal-ai/flux-2-pro", {"prompt": "x"})
+
+    def test_direct_fal_errors_are_not_translated(self, image_tool, monkeypatch):
+        """When user has direct FAL_KEY (managed gateway returns None), raw
+        errors from fal_client bubble up unchanged — fal_client already
+        provides reasonable error messages for direct usage."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
+                            lambda: None)
+
+        direct_error = _MockHttpxError(403, "Forbidden")
+        fake_fal_client = MagicMock()
+        fake_fal_client.submit.side_effect = direct_error
+        monkeypatch.setattr(image_tool, "fal_client", fake_fal_client)
+
+        with pytest.raises(_MockHttpxError):
+            image_tool._submit_fal_request("fal-ai/flux-2-pro", {"prompt": "x"})
+
+    def test_non_http_exception_from_managed_bubbles_up(self, image_tool, monkeypatch):
+        """Connection errors, timeouts, etc. from managed mode aren't 4xx —
+        they should bubble up unchanged so callers can retry or diagnose."""
+        from unittest.mock import MagicMock
+
+        managed_gateway = MagicMock()
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
+                            lambda: managed_gateway)
+
+        conn_error = ConnectionError("network down")
+        mock_managed_client = MagicMock()
+        mock_managed_client.submit.side_effect = conn_error
+        monkeypatch.setattr(image_tool, "_get_managed_fal_client",
+                            lambda gw: mock_managed_client)
+
+        with pytest.raises(ConnectionError):
+            image_tool._submit_fal_request("fal-ai/flux-2-pro", {"prompt": "x"})
